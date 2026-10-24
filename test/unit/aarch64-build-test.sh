@@ -118,6 +118,17 @@ result=$(filter_aarch64_packages linux-omarchy linux linux-headers linux-omarchy
 # The N1x list names linux-omarchy, and keeps the name.
 result=$(filter_aarch64_packages linux-omarchy linux-omarchy linux-omarchy-headers 2>/dev/null | paste -sd' ')
 [[ $result == "linux-omarchy linux-omarchy-headers" ]] || fail "linux-omarchy lost its name on its own image: $result"
+# Omarchy's optional list names firmware that only aarch64 boards have, such
+# as the ProArt amplifier tunings: an x86_64 mirror leaves it out, an aarch64
+# one keeps it.
+mirror_for() { # arch
+  local OMARCHY_ARCH=$1 all_packages=(base asus-proart-p14-speaker-firmware asus-proart-p16-speaker-firmware iptsd hyprland)
+  eval "$(sed -n "/^# x86_64: Omarchy's optional list/,/^fi$/p" "$ROOT/builder/build-iso.sh")" 2>/dev/null
+  printf '%s ' "${all_packages[@]}"
+}
+[[ $(mirror_for x86_64) == "base hyprland " ]] || fail "the x86_64 offline mirror asks for aarch64-only packages: $(mirror_for x86_64)"
+[[ $(mirror_for aarch64) == "base asus-proart-p14-speaker-firmware asus-proart-p16-speaker-firmware iptsd hyprland " ]] \
+  || fail "the aarch64 offline mirror drops its own boards' packages: $(mirror_for aarch64)"
 
 grep -Fq -- '-e "OMARCHY_RUNTIME_PACKAGE=${OMARCHY_RUNTIME_PACKAGE:-}"' "$ROOT/bin/omarchy-iso-make" \
   || fail "the Omarchy package pair cannot be overridden for a --local-source build"
