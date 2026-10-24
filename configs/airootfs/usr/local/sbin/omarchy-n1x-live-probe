@@ -37,15 +37,19 @@ show() {
   done
 }
 
+# Serial numbers, asset tags and the system UUID name the machine, not its
+# hardware, so dmidecode's values for them stay behind.
+redact_dmi() {
+  sed -E 's/^([[:space:]]*(Serial Number|UUID|Asset Tag):).*/\1 (removed)/'
+}
+
 collect_bundle() {
   local dev drv zone
 
   mkdir -p "$bundle/acpi-tables" || return 1
   cat /proc/cmdline >"$bundle/cmdline.txt"
 
-  # Serial numbers and the system UUID name the machine, not its hardware.
-  run dmidecode -t 0,1,2,3,4,17 |
-    sed -E 's/^([[:space:]]*(Serial Number|UUID|Asset Tag):).*/\1 (removed)/' >"$bundle/dmi.txt"
+  run dmidecode -t 0,1,2,3,4,17 | redact_dmi >"$bundle/dmi.txt"
 
   # _STA as Linux read it: 0 is hidden, 15 present, and a device without a
   # status file has no _STA and is present.

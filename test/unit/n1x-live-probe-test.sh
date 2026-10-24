@@ -2,7 +2,8 @@
 #
 # The N1x recovery entry's probe copies its evidence onto a partition
 # labelled OMARCHY-PROBE, and only onto one on a removable or USB disk: it
-# must never write to the laptop's own disks.
+# must never write to the laptop's own disks. The evidence leaves out the
+# Windows product key and the SMBIOS serial numbers.
 
 set -euo pipefail
 
@@ -18,6 +19,20 @@ grep -Fqx 'probe_label=OMARCHY-PROBE' "$probe" || fail "the probe does not look 
 grep -Fq '! -name '\''MSDM*'\' "$probe" || fail "the probe would copy the Windows product key"
 grep -Fq 'EXPOSED_DISP_FRM-4b086294-0740-4f71-a7b5-85a329c7ec5f' "$probe" || fail "the probe does not record the GPU carve-out"
 grep -Fq 'NVDA8400' "$probe" || fail "the probe does not show whether SSPM is hidden"
+
+# The SMBIOS dump keeps what names the hardware and drops what names the one
+# machine.
+grep -Fq 'run dmidecode -t 0,1,2,3,4,17 | redact_dmi >' "$probe" || fail "the probe's SMBIOS dump is not redacted"
+eval "$(sed -n '/^redact_dmi() {$/,/^}$/p' "$probe")"
+redacted=$(printf '%s\n' 'System Information' $'\tProduct Name: ProArt P16 H7607BA' $'\tSerial Number: SYSTEM-SERIAL' \
+  $'\tUUID: 01234567-89ab-cdef-0123-456789abcdef' 'Base Board Information' $'\tSerial Number: BOARD-SERIAL' \
+  $'\tAsset Tag: BOARD-TAG' 'Memory Device' $'\tSerial Number: DIMM-SERIAL' $'\tPart Number: MT62F4G32D8DV-023' | redact_dmi)
+grep -Eq 'SERIAL|01234567|BOARD-TAG' <<<"$redacted" && fail "the SMBIOS dump keeps a serial number, asset tag or UUID: $redacted"
+[[ $(grep -c ': (removed)$' <<<"$redacted") == 5 ]] || fail "the SMBIOS dump does not mark what it left out: $redacted"
+grep -Fqx $'\tProduct Name: ProArt P16 H7607BA' <<<"$redacted" && grep -Fqx $'\tPart Number: MT62F4G32D8DV-023' <<<"$redacted" \
+  || fail "the SMBIOS dump lost the hardware's identity: $redacted"
+echo "ok - the SMBIOS dump leaves out serial numbers, asset tags and the UUID"
+
 eval "$(sed -n '/^copy_to_probe_partition() {$/,/^}$/p' "$probe")"
 declare -F copy_to_probe_partition >/dev/null || fail "the probe has no copy_to_probe_partition"
 
