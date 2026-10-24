@@ -45,7 +45,9 @@ The first boot lands on the Omarchy login screen, drawn by the NVIDIA GPU.
 The **USB stick** boots the installer without showing a menu. Press Esc while it starts for:
 
 - **Omarchy with speakup screen reader**.
-- **N1x recovery shell (hardware probe, no installer)**. Records the GPU, display, input and network state to `/var/log/omarchy-n1x-live-probe.log` and leaves you at a root prompt, without touching the disk.
+- **N1x recovery shell (hardware probe, no installer)**. Records the GPU, display, input and network state to `/var/log/omarchy-n1x-live-probe.log`, with the raw evidence for bringing up a new laptop in `/var/log/omarchy-n1x-live-probe-<date>-<time>/`, and leaves you at a root prompt, without touching the disk.
+
+The live system forgets both when it powers off. To keep them, plug in a second USB stick with a partition labelled `OMARCHY-PROBE` before you pick the recovery shell, or run `omarchy-n1x-live-probe` again at its prompt once it is in. The probe copies the log and the evidence into a new folder there and unmounts it; it only writes to a removable or USB disk, never to the laptop's own, and a card in the laptop's SD slot counts as the laptop's own. FAT32 and exFAT labels stop at 11 characters, so format the partition NTFS on Windows or ext4 (`mkfs.ext4 -L OMARCHY-PROBE`) on Linux. Serial numbers and the Windows product key are left out of the evidence; MAC addresses are not, so look through it before you share it.
 
 The **installed system** (Limine) offers:
 
