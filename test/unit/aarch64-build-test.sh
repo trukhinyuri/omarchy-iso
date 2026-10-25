@@ -90,15 +90,17 @@ for cfg in grub.cfg loopback.cfg; do
   # The same block, run as bash with GRUB's commands stubbed, decides for each
   # machine. `set var=value` is GRUB's assignment.
   osi_block=$(sed -n '/^set n1x_osi=$/,/^fi$/p' "$src" | sed -E 's/^([[:space:]]*)set ([[:alnum:]_]+)=/\1\2=/')
-  osi_for() { # grub_cpu, then the SMBIOS product name (none: smbios fails)
-    local grub_cpu=$1 n1x_osi product_name fw_product
-    (( $# > 1 )) && fw_product=$2
+  gate_for() { # variable, grub_cpu, then the SMBIOS product name (none: smbios fails)
+    local var=$1 grub_cpu=$2 n1x_osi p16_bringup timeout timeout_style default product_name fw_product
+    (( $# > 2 )) && fw_product=$3
     insmod() { :; }
     smbios() { [[ -n ${fw_product+set} ]] || return 1; product_name=$fw_product; }
     regexp() { [[ $2 =~ $1 ]]; }
     eval "$osi_block"
-    printf '%s' "$n1x_osi"
+    printf '%s' "${!var-}"
   }
+  osi_for() { gate_for n1x_osi "$@"; }
+  bringup_for() { gate_for p16_bringup "$@"; }
   [[ $(osi_for arm64 83SS) == 'acpi_osi=!' ]] || fail "$cfg does not pass acpi_osi=! on the Lenovo Pro 9"
   [[ $(osi_for arm64 'ProArt P16 H7607BA') == 'acpi_osi=!' ]] || fail "$cfg does not pass acpi_osi=! on the ASUS ProArt P16"
   for product in 'ProArt P14 H7407BA' 'XPS 16 DX16263' 'ProArt P16 H7606WI' 83SSX; do
@@ -106,10 +108,52 @@ for cfg in grub.cfg loopback.cfg; do
   done
   [[ -z $(osi_for arm64) ]] || fail "$cfg passes acpi_osi=! without an SMBIOS product name"
   [[ -z $(osi_for x86_64 'ProArt P16 H7607BA') ]] || fail "$cfg passes acpi_osi=! outside arm64"
+  # Fork only: the ProArt P16's bring-up entries sit behind p16_bringup,
+  # which only the H7607BA arm sets. Their recovery shell that keeps the
+  # firmware's _OSI is the one live linux line without n1x_osi, and only two
+  # of them leave out the MediaTek UART.
+  [[ $(bringup_for arm64 'ProArt P16 H7607BA') == 1 ]] || fail "$cfg does not offer the P16 bring-up entries on the ASUS ProArt P16"
+  for product in 83SS 'ProArt P14 H7407BA' 'XPS 16 DX16263' 'ProArt P16 H7606WI'; do
+    [[ -z $(bringup_for arm64 "$product") ]] || fail "$cfg offers the P16 bring-up entries on $product"
+  done
+  [[ -z $(bringup_for arm64) && -z $(bringup_for x86_64 'ProArt P16 H7607BA') ]] \
+    || fail "$cfg offers the P16 bring-up entries without SMBIOS or outside arm64"
+  # On the P16 alone the menu shows for 10 seconds and then boots the
+  # recovery shell. The three settings sit in its arm of the gate and
+  # nowhere else, so every other machine keeps the hidden menu and boots
+  # the installer at once.
+  menu_for() { printf '%s/%s/%s' "$(gate_for timeout "$@")" "$(gate_for timeout_style "$@")" "$(gate_for default "$@")"; }
+  [[ $(menu_for arm64 'ProArt P16 H7607BA') == 10/menu/n1x-recovery ]] \
+    || fail "$cfg does not show the menu and default to the recovery shell on the ASUS ProArt P16: $(menu_for arm64 'ProArt P16 H7607BA')"
+  for product in 83SS 'ProArt P14 H7407BA' 'XPS 16 DX16263' 'ProArt P16 H7606WI'; do
+    [[ $(menu_for arm64 "$product") == // ]] || fail "$cfg changes the boot menu on $product: $(menu_for arm64 "$product")"
+  done
+  [[ $(menu_for arm64) == // && $(menu_for x86_64 'ProArt P16 H7607BA') == // ]] \
+    || fail "$cfg changes the boot menu without SMBIOS or outside arm64"
+  p16_arm=$(awk -v arm="elif regexp 'H7607BA' \"\${product_name}\"; then" '
+    { line = $0; sub(/^[[:space:]]+/, "", line) }
+    on && line ~ /^(elif|else|fi)([[:space:]]|$)/ { exit }
+    on { print line }
+    line == arm { on = 1 }' "$src")
+  for setting in timeout=10 timeout_style=menu default=n1x-recovery; do
+    [[ $(grep -Fcx "set $setting" <<<"$p16_arm") == 1 && $(grep -cE "^[[:space:]]*(set )?$setting\$" "$src") == 1 ]] \
+      || fail "$cfg sets $setting elsewhere than in the ASUS ProArt P16's arm"
+  done
+  bringup=$(awk -v gate='if [ "${p16_bringup}" == 1 ]; then' '$0 == gate { on = 1 } on { print } on && $0 == "fi" { exit }' "$src")
+  [[ $(grep -c -- "--id 'p16-" <<<"$bringup") == 3 && $(grep -c -- "--id 'p16-" "$src") == 3 ]] \
+    || fail "$cfg does not keep its three P16 bring-up entries behind the P16 gate"
   linux_lines=$(grep -E '^[[:space:]]*linux /%INSTALL_DIR%/boot/%ARCH%/vmlinuz-' "$src")
   linux_count=$(printf '%s\n' "$linux_lines" | grep -c .)
   osi_count=$(printf '%s\n' "$linux_lines" | grep -c ' ${n1x_osi}$')
-  (( linux_count >= 3 && linux_count == osi_count )) || fail "$cfg does not pass n1x_osi on every live linux line ($osi_count/$linux_count)"
+  (( linux_count >= 6 && linux_count == osi_count + 1 )) || fail "$cfg does not pass n1x_osi on every live linux line but one ($osi_count/$linux_count)"
+  grep -E '^[[:space:]]*linux ' <<<"$bringup" | grep -v ' ${n1x_osi}$' | grep -Fq 'omarchy.n1x_recovery=1' \
+    || fail "$cfg: the live linux line without n1x_osi is not the P16's firmware _OSI recovery shell"
+  [[ $(grep -c ' initcall_blacklist=mtk8250_platform_driver_init ${n1x_osi}$' <<<"$bringup") == 2 \
+    && $(grep -c 'initcall_blacklist=' "$src") == 2 ]] || fail "$cfg leaves out the MediaTek UART elsewhere than in two P16 bring-up entries"
+  # Every recovery shell has 1G of copy-on-write space for its evidence.
+  [[ $(grep -c 'omarchy.n1x_recovery=1' <<<"$linux_lines") == 3 \
+    && $(grep -c ' cow_spacesize=1G omarchy.n1x_recovery=1 ' <<<"$linux_lines") == 3 ]] \
+    || fail "$cfg gives a recovery shell less copy-on-write space than 1G"
   source "$ROOT/builder/grub-platform.sh"
   for platform in x86_64 aarch64; do
     cp "$src" "$fixture/$platform-$cfg"
@@ -120,9 +164,11 @@ for cfg in grub.cfg loopback.cfg; do
       grub-script-check "$fixture/$platform-$cfg" || fail "$cfg ($platform) is not valid GRUB script"
     fi
     if [[ $platform == aarch64 ]]; then
-      grep -Fq 'n1x-recovery' "$fixture/$platform-$cfg" || fail "the aarch64 menu lost the N1x recovery entry in $cfg"
+      grep -Fq -- "--id 'n1x-recovery'" "$fixture/$platform-$cfg" || fail "the aarch64 menu lost the N1x recovery entry in $cfg"
+      [[ $(grep -c -- "--id 'p16-" "$fixture/$platform-$cfg") == 3 ]] || fail "the aarch64 menu lost the P16 bring-up entries in $cfg"
     else
-      grep -Fq 'n1x-recovery' "$fixture/$platform-$cfg" && fail "recovery entry leaked into the $platform $cfg"
+      grep -Fq -- "--id 'n1x-recovery'" "$fixture/$platform-$cfg" && fail "recovery entry leaked into the $platform $cfg"
+      grep -Fq -- "--id 'p16-" "$fixture/$platform-$cfg" && fail "P16 bring-up entries leaked into the $platform $cfg"
     fi
     grep -Eq '^%N1X_ONLY' "$fixture/$platform-$cfg" && fail "template markers remain in $cfg"
     grep -Fqx 'timeout_style=hidden' "$fixture/$platform-$cfg" || fail "$cfg ($platform) shows the boot menu"
