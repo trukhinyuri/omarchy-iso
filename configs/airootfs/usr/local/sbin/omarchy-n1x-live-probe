@@ -68,6 +68,15 @@ collect_bundle() {
   # and stays behind.
   (cd /sys/firmware/acpi/tables 2>/dev/null &&
     find . -type f ! -name 'MSDM*' -exec cp --parents {} "$bundle/acpi-tables/" \;)
+  # Which driver took each platform device the firmware describes, SSPM
+  # (NVDA8400), the UARTs (NVDA0240) and the xHCI controllers (NVDA8000,
+  # NVDA8001) among them; - where none did.
+  for dev in /sys/bus/platform/devices/*; do
+    [[ -e $dev/firmware_node ]] || continue
+    drv=$(readlink "$dev/driver" 2>/dev/null) || drv=-
+    printf '%s hid=%s path=%s driver=%s\n' "${dev##*/}" "$(cat "$dev/firmware_node/hid" 2>/dev/null || echo -)" \
+      "$(cat "$dev/firmware_node/path" 2>/dev/null || echo -)" "${drv##*/}"
+  done >"$bundle/platform-devices.txt"
   # Why a driver has not bound: an I2C controller still waiting for SSPM's
   # Power Wrap, say. The live system mounts debugfs.
   show /sys/kernel/debug/devices_deferred >"$bundle/deferred.txt"
@@ -138,6 +147,13 @@ collect_bundle() {
   } >"$bundle/audio.txt"
 
   { run free -g; show /proc/iomem; } >"$bundle/memory.txt"
+  # The framebuffer the firmware leaves the console until a GPU driver
+  # takes the panel: its mode, and where it sits in memory.
+  {
+    show /sys/class/graphics/fb*/{name,virtual_size,stride,bits_per_pixel}
+    echo
+    run grep -Ei 'BOOTFB|simple-framebuffer|simplefb|simpledrm|efifb' /proc/iomem
+  } >"$bundle/framebuffer.txt"
   {
     # The GPU carve-out Omarchy hands back to Linux: four attribute bytes,
     # then the layout omarchy-apply-n1x-gpu-memory checks.

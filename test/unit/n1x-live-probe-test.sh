@@ -21,6 +21,8 @@ grep -Fqx 'probe_labels=(OMARCHY-PROBE N1XPROBE)' "$probe" || fail "the probe do
 grep -Fq '! -name '\''MSDM*'\' "$probe" || fail "the probe would copy the Windows product key"
 grep -Fq 'EXPOSED_DISP_FRM-4b086294-0740-4f71-a7b5-85a329c7ec5f' "$probe" || fail "the probe does not record the GPU carve-out"
 grep -Fq 'NVDA8400' "$probe" || fail "the probe does not show whether SSPM is hidden"
+grep -Fq '>"$bundle/platform-devices.txt"' "$probe" || fail "the probe does not record which driver took each platform device"
+grep -Fq '>"$bundle/framebuffer.txt"' "$probe" || fail "the probe does not record the boot framebuffer"
 
 # The SMBIOS dump keeps what names the hardware and drops what names the one
 # machine.
