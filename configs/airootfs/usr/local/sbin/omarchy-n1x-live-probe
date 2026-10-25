@@ -4,10 +4,12 @@ set -u
 
 log=/var/log/omarchy-n1x-live-probe.log
 # What a bring-up needs and the screen has no room for goes to files next to
-# the log, and from there with the log onto a partition labelled
-# OMARCHY-PROBE when a removable or USB disk carries one.
+# the log, and from there with the log into probe/ on a removable or USB
+# partition named OMARCHY-PROBE in its GPT, or labelled OMARCHY-PROBE or
+# N1XPROBE: FAT and exFAT labels stop at 11 characters.
 bundle=/var/log/omarchy-n1x-live-probe-$(date +%Y%m%d-%H%M%S)
-probe_label=OMARCHY-PROBE
+probe_partlabel=OMARCHY-PROBE
+probe_labels=(OMARCHY-PROBE N1XPROBE)
 
 section() {
   echo
@@ -44,10 +46,15 @@ redact_dmi() {
 }
 
 collect_bundle() {
-  local dev drv zone
+  local card dev drv zone
 
+  # Drivers that come up late belong in the evidence too (the amplifiers
+  # load firmware, I2C-HID waits for its controller): wait for udev, but
+  # not forever.
+  udevadm settle --timeout=30 2>/dev/null
   mkdir -p "$bundle/acpi-tables" || return 1
   cat /proc/cmdline >"$bundle/cmdline.txt"
+  [[ -r /proc/config.gz ]] && zcat /proc/config.gz >"$bundle/kernel-config.txt"
 
   run dmidecode -t 0,1,2,3,4,17 | redact_dmi >"$bundle/dmi.txt"
 
@@ -61,6 +68,16 @@ collect_bundle() {
   # and stays behind.
   (cd /sys/firmware/acpi/tables 2>/dev/null &&
     find . -type f ! -name 'MSDM*' -exec cp --parents {} "$bundle/acpi-tables/" \;)
+  # Why a driver has not bound: an I2C controller still waiting for SSPM's
+  # Power Wrap, say. The live system mounts debugfs.
+  show /sys/kernel/debug/devices_deferred >"$bundle/deferred.txt"
+  show /proc/interrupts >"$bundle/interrupts.txt"
+  # The idle states the firmware's _LPI leaves usable.
+  show /sys/devices/system/cpu/cpuidle/current_driver \
+    /sys/devices/system/cpu/cpu*/cpuidle/state*/{name,desc,disable,usage,time} \
+    /sys/power/mem_sleep >"$bundle/idle.txt"
+  # Model and size only: no serial numbers.
+  run lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,PARTLABEL,RM,TRAN,MODEL >"$bundle/disks.txt"
 
   run lspci -nnvvv >"$bundle/pci.txt"
   { run lsusb -tv; run lsusb -v; } >"$bundle/usb.txt"
@@ -91,6 +108,19 @@ collect_bundle() {
       fi
     done
     echo
+    show /proc/bus/input/devices
+    echo
+    # The sensor hub is HID over SPI.
+    run ls -l /sys/bus/spi/devices
+    for dev in /sys/bus/spi/devices/*; do
+      [[ -e $dev ]] || continue
+      drv=$(readlink "$dev/driver" 2>/dev/null)
+      printf '%s modalias=%s acpi=%s driver=%s\n' "${dev##*/}" "$(cat "$dev/modalias" 2>/dev/null)" \
+        "$(cat "$dev/firmware_node/path" 2>/dev/null)" "${drv##*/}"
+    done
+    echo
+    show /sys/kernel/debug/gpio
+    echo
     run libinput list-devices
   } >"$bundle/input.txt"
 
@@ -99,8 +129,12 @@ collect_bundle() {
     echo
     run aplay -l
     run arecord -l
-    run amixer -c0 contents
+    for card in /proc/asound/card[0-9]*; do
+      [[ -d $card ]] && run amixer -c "${card##*card}" contents
+    done
     run ls -l /sys/bus/soundwire/devices
+    show /sys/bus/soundwire/devices/*/modalias /sys/bus/soundwire/devices/*/status \
+      /sys/kernel/debug/asoc/components
   } >"$bundle/audio.txt"
 
   { run free -g; show /proc/iomem; } >"$bundle/memory.txt"
@@ -108,6 +142,8 @@ collect_bundle() {
     # The GPU carve-out Omarchy hands back to Linux: four attribute bytes,
     # then the layout omarchy-apply-n1x-gpu-memory checks.
     run od -An -tx1 /sys/firmware/efi/efivars/EXPOSED_DISP_FRM-4b086294-0740-4f71-a7b5-85a329c7ec5f
+    run od -An -tx1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+    run efibootmgr
     run ls /sys/firmware/efi/efivars
   } >"$bundle/efi.txt"
   run boltctl list >"$bundle/usb4.txt"
@@ -137,18 +173,31 @@ collect_bundle() {
   } >"$bundle/wireless.txt"
 }
 
+is_probe_partition() { # GPT partition name, file system label
+  local want
+  [[ $1 == "$probe_partlabel" ]] && return 0
+  for want in "${probe_labels[@]}"; do
+    [[ ${2^^} == "$want" ]] && return 0
+  done
+  return 1
+}
+
 # Keep the evidence past the live session: copy the bundle into a new
-# directory on a partition labelled OMARCHY-PROBE. Only a removable or USB
+# directory under probe/ on the probe partition. Only a removable or USB
 # disk qualifies, so the probe never writes to the laptop's own disks.
 copy_to_probe_partition() {
-  local part label disk rm tran mnt dest copied=
-  while read -r part label; do
-    [[ ${label^^} == "$probe_label" ]] || continue
+  local part partlabel label disk rm tran mnt dest copied=
+  while read -r part; do
+    # One device per query: with an empty PARTLABEL, the label would slide
+    # into its column on a shared lsblk -r line.
+    partlabel=$(lsblk -dno PARTLABEL "$part" 2>/dev/null)
+    label=$(lsblk -dno LABEL "$part" 2>/dev/null)
+    is_probe_partition "$partlabel" "$label" || continue
     disk=$(lsblk -dnpo PKNAME "$part")
     disk=${disk:-$part}
     read -r rm tran < <(lsblk -dnro RM,TRAN "$disk")
     if [[ $rm != 1 && $tran != usb ]]; then
-      echo "$part is labelled $label, but $disk is neither removable nor on USB: not writing to it"
+      echo "$part (${partlabel:-no name}, ${label:-no label}) is on $disk, which is neither removable nor on USB: not writing to it"
       continue
     fi
     mnt=$(mktemp -d -t omarchy-probe.XXXXXX) || return 1
@@ -157,17 +206,17 @@ copy_to_probe_partition() {
       rmdir "$mnt"
       continue
     fi
-    dest=$mnt/${bundle##*/}
-    mkdir "$dest" && cp -R "$bundle/." "$dest/" && copied=1
+    dest=$mnt/probe/${bundle##*/}
+    mkdir -p "$dest" && cp -R "$bundle/." "$dest/" && copied=1
     sync -f "$mnt"
     umount "$mnt" && rmdir "$mnt"
     if [[ -n $copied ]]; then
-      echo "Copied to $part on $disk: ${dest##*/}"
+      echo "Copied to $part on $disk: probe/${bundle##*/}"
       return 0
     fi
     echo "Could not copy to $part"
-  done < <(lsblk -nrpo NAME,LABEL)
-  echo "No removable or USB partition labelled $probe_label: the evidence stays in $bundle until the next boot"
+  done < <(lsblk -nrpo NAME)
+  echo "No removable or USB partition named $probe_partlabel or labelled ${probe_labels[*]}: the evidence stays in $bundle until the next boot"
   return 1
 }
 
@@ -214,9 +263,10 @@ copy_to_probe_partition() {
 
   # Some N1x firmware hides SSPM, HFRP and SVP0 when the kernel claims
   # _OSI("Windows 2022"), and without SSPM the I2C controllers behind the
-  # keyboard and touchpad stay off. Status 0 is hidden, 15 present.
-  section "ACPI status of SSPM, HFRP, SVP0 and the I2C controllers"
-  for hid in NVDA8400 MTK00055 NVDA3000 NVDA0200; do
+  # keyboard and touchpad stay off, and so does the SPI sensor hub. Status 0
+  # is hidden, 15 present.
+  section "ACPI status of SSPM, HFRP, SVP0 and the I2C and SPI controllers"
+  for hid in NVDA8400 MTK00055 NVDA3000 NVDA0200 NVDA0210; do
     found=
     for dev in /sys/bus/acpi/devices/"$hid":*; do
       [[ -e $dev ]] || continue
