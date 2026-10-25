@@ -45,7 +45,9 @@ The first boot lands on the Omarchy login screen, drawn by the NVIDIA GPU.
 The **USB stick** boots the installer without showing a menu. Press Esc while it starts for:
 
 - **Omarchy with speakup screen reader**.
-- **N1x recovery shell (hardware probe, no installer)**. Records the GPU, display, input and network state to `/var/log/omarchy-n1x-live-probe.log` and leaves you at a root prompt, without touching the disk.
+- **N1x recovery shell (hardware probe, no installer)**. Records the GPU, display, input and network state to `/var/log/omarchy-n1x-live-probe.log`, with the raw evidence for bringing up a new laptop in `/var/log/omarchy-n1x-live-probe-<date>-<time>/`, and leaves you at a root prompt, without touching the disk. To boot it without the menu, press `r` a few times right after you pick the stick in the firmware's boot menu: GRUB checks once for a waiting key just before it would start the installer, and `r` is this entry's key.
+
+The live system forgets both when it powers off. To keep them, plug in a USB stick with a partition named `OMARCHY-PROBE` in its partition table, or with a file system labelled `N1XPROBE` (exFAT or FAT32, whose labels stop at 11 characters, so this is the one to use when formatting on Windows) or `OMARCHY-PROBE` (NTFS, or ext4 with `mkfs.ext4 -L OMARCHY-PROBE`), before you pick the recovery shell, or run `omarchy-n1x-live-probe` again at its prompt once it is in. The installer stick can carry that partition itself, after the ISO's own two. The probe copies the log and the evidence into a new folder under `probe/` there and unmounts it; it only writes to a removable or USB disk, never to the laptop's own, and a card in the laptop's SD slot counts as the laptop's own unless the slot is a USB card reader. The Windows product key and the SMBIOS serial numbers and UUID are left out of the evidence. MAC addresses and the serial numbers USB and PCIe devices report, in the kernel log and the USB and PCI listings, are not, so look through it before you share it.
 
 The **installed system** (Limine) offers:
 

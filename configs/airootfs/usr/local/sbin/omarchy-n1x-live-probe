@@ -3,10 +3,237 @@
 set -u
 
 log=/var/log/omarchy-n1x-live-probe.log
+# What a bring-up needs and the screen has no room for goes to files next to
+# the log, and from there with the log into probe/ on a removable or USB
+# partition named OMARCHY-PROBE in its GPT, or labelled OMARCHY-PROBE or
+# N1XPROBE: FAT and exFAT labels stop at 11 characters.
+bundle=/var/log/omarchy-n1x-live-probe-$(date +%Y%m%d-%H%M%S)
+probe_partlabel=OMARCHY-PROBE
+probe_labels=(OMARCHY-PROBE N1XPROBE)
 
 section() {
   echo
   echo "===== $* ====="
+}
+
+# Run a command under the line that names it. A tool this image lacks is
+# noted rather than fatal, and no command may hang the probe.
+run() {
+  echo "\$ $*"
+  if command -v "$1" >/dev/null; then
+    timeout 30 "$@" 2>&1 || echo "(exit status $?)"
+  else
+    echo "$1: not in this image"
+  fi
+  echo
+}
+
+# Print each readable file under its name. Some are read through ACPI, a
+# battery's for one, so each read is bounded too.
+show() {
+  local file
+  for file in "$@"; do
+    [[ -r $file ]] || continue
+    echo "--- $file"
+    timeout 10 cat "$file" 2>&1
+  done
+}
+
+# Serial numbers, asset tags and the system UUID name the machine, not its
+# hardware, so dmidecode's values for them stay behind.
+redact_dmi() {
+  sed -E 's/^([[:space:]]*(Serial Number|UUID|Asset Tag):).*/\1 (removed)/'
+}
+
+collect_bundle() {
+  local card dev drv zone
+
+  # Drivers that come up late belong in the evidence too (the amplifiers
+  # load firmware, I2C-HID waits for its controller): wait for udev, but
+  # not forever.
+  udevadm settle --timeout=30 2>/dev/null
+  mkdir -p "$bundle/acpi-tables" || return 1
+  cat /proc/cmdline >"$bundle/cmdline.txt"
+  [[ -r /proc/config.gz ]] && zcat /proc/config.gz >"$bundle/kernel-config.txt"
+
+  run dmidecode -t 0,1,2,3,4,17 | redact_dmi >"$bundle/dmi.txt"
+
+  # _STA as Linux read it: 0 is hidden, 15 present, and a device without a
+  # status file has no _STA and is present.
+  for dev in /sys/bus/acpi/devices/*; do
+    printf '%s hid=%s status=%s path=%s\n' "${dev##*/}" "$(cat "$dev/hid" 2>/dev/null || echo -)" \
+      "$(cat "$dev/status" 2>/dev/null || echo -)" "$(cat "$dev/path" 2>/dev/null || echo -)"
+  done >"$bundle/acpi-devices.txt"
+  # The firmware's tables, for iasl -d. MSDM carries the Windows product key
+  # and stays behind.
+  (cd /sys/firmware/acpi/tables 2>/dev/null &&
+    find . -type f ! -name 'MSDM*' -exec cp --parents {} "$bundle/acpi-tables/" \;)
+  # Which driver took each platform device the firmware describes, SSPM
+  # (NVDA8400), the UARTs (NVDA0240) and the xHCI controllers (NVDA8000,
+  # NVDA8001) among them; - where none did.
+  for dev in /sys/bus/platform/devices/*; do
+    [[ -e $dev/firmware_node ]] || continue
+    drv=$(readlink "$dev/driver" 2>/dev/null) || drv=-
+    printf '%s hid=%s path=%s driver=%s\n' "${dev##*/}" "$(cat "$dev/firmware_node/hid" 2>/dev/null || echo -)" \
+      "$(cat "$dev/firmware_node/path" 2>/dev/null || echo -)" "${drv##*/}"
+  done >"$bundle/platform-devices.txt"
+  # Why a driver has not bound: an I2C controller still waiting for SSPM's
+  # Power Wrap, say. The live system mounts debugfs.
+  show /sys/kernel/debug/devices_deferred >"$bundle/deferred.txt"
+  show /proc/interrupts >"$bundle/interrupts.txt"
+  # The idle states the firmware's _LPI leaves usable.
+  show /sys/devices/system/cpu/cpuidle/current_driver \
+    /sys/devices/system/cpu/cpu*/cpuidle/state*/{name,desc,disable,usage,time} \
+    /sys/power/mem_sleep >"$bundle/idle.txt"
+  # Model and size only: no serial numbers.
+  run lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,PARTLABEL,RM,TRAN,MODEL >"$bundle/disks.txt"
+
+  run lspci -nnvvv >"$bundle/pci.txt"
+  { run lsusb -tv; run lsusb -v; } >"$bundle/usb.txt"
+  run dmesg >"$bundle/dmesg.txt"
+  run journalctl -b --no-pager >"$bundle/journal.txt"
+  grep -Ei 'cs35l56|cs42l43|soundwire|sdw|mtk|mediatek|power_wrap|pwrap|sspm|scmi' "$bundle/dmesg.txt" \
+    >"$bundle/platform-log.txt"
+
+  {
+    run ls -l /sys/bus/i2c/devices
+    for dev in /sys/bus/i2c/devices/*; do
+      [[ -e $dev ]] || continue
+      drv=$(readlink "$dev/driver" 2>/dev/null)
+      printf '%s name=%s acpi=%s driver=%s\n' "${dev##*/}" "$(cat "$dev/name" 2>/dev/null)" \
+        "$(cat "$dev/firmware_node/path" 2>/dev/null)" "${drv##*/}"
+    done
+    echo
+    run ls -l /sys/bus/hid/devices
+    # Report descriptors, parsed where debugfs is mounted.
+    for dev in /sys/bus/hid/devices/*; do
+      [[ -e $dev ]] || continue
+      echo "--- ${dev##*/}"
+      cat "$dev/uevent" 2>/dev/null
+      if [[ -r /sys/kernel/debug/hid/${dev##*/}/rdesc ]]; then
+        cat "/sys/kernel/debug/hid/${dev##*/}/rdesc"
+      else
+        od -An -tx1 "$dev/report_descriptor" 2>/dev/null
+      fi
+    done
+    echo
+    show /proc/bus/input/devices
+    echo
+    # The sensor hub is HID over SPI.
+    run ls -l /sys/bus/spi/devices
+    for dev in /sys/bus/spi/devices/*; do
+      [[ -e $dev ]] || continue
+      drv=$(readlink "$dev/driver" 2>/dev/null)
+      printf '%s modalias=%s acpi=%s driver=%s\n' "${dev##*/}" "$(cat "$dev/modalias" 2>/dev/null)" \
+        "$(cat "$dev/firmware_node/path" 2>/dev/null)" "${drv##*/}"
+    done
+    echo
+    show /sys/kernel/debug/gpio
+    echo
+    run libinput list-devices
+  } >"$bundle/input.txt"
+
+  {
+    show /proc/asound/cards
+    echo
+    run aplay -l
+    run arecord -l
+    for card in /proc/asound/card[0-9]*; do
+      [[ -d $card ]] && run amixer -c "${card##*card}" contents
+    done
+    run ls -l /sys/bus/soundwire/devices
+    show /sys/bus/soundwire/devices/*/modalias /sys/bus/soundwire/devices/*/status \
+      /sys/kernel/debug/asoc/components
+  } >"$bundle/audio.txt"
+
+  { run free -g; show /proc/iomem; } >"$bundle/memory.txt"
+  # The framebuffer the firmware leaves the console until a GPU driver
+  # takes the panel: its mode, and where it sits in memory.
+  {
+    show /sys/class/graphics/fb*/{name,virtual_size,stride,bits_per_pixel}
+    echo
+    run grep -Ei 'BOOTFB|simple-framebuffer|simplefb|simpledrm|efifb' /proc/iomem
+  } >"$bundle/framebuffer.txt"
+  {
+    # The GPU carve-out Omarchy hands back to Linux: four attribute bytes,
+    # then the layout omarchy-apply-n1x-gpu-memory checks.
+    run od -An -tx1 /sys/firmware/efi/efivars/EXPOSED_DISP_FRM-4b086294-0740-4f71-a7b5-85a329c7ec5f
+    run od -An -tx1 /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+    run efibootmgr
+    run ls /sys/firmware/efi/efivars
+  } >"$bundle/efi.txt"
+  run boltctl list >"$bundle/usb4.txt"
+  run nvidia-smi -q >"$bundle/nvidia-smi.txt"
+
+  {
+    show /sys/class/power_supply/*/uevent
+    echo
+    for zone in /sys/class/thermal/*; do
+      [[ -r $zone/type ]] || continue
+      printf '%s %s %s\n' "${zone##*/}" "$(cat "$zone/type")" "$(timeout 10 cat "$zone/temp" 2>/dev/null || echo -)"
+    done
+    echo
+    show /sys/class/backlight/*/{type,brightness,actual_brightness,max_brightness}
+  } >"$bundle/power.txt"
+  {
+    show /sys/bus/iio/devices/*/name
+    show /sys/class/hwmon/*/name
+    echo
+    run sensors
+  } >"$bundle/sensors.txt"
+  {
+    run rfkill list
+    run ip a
+    run iw dev
+    run bluetoothctl show
+  } >"$bundle/wireless.txt"
+}
+
+is_probe_partition() { # GPT partition name, file system label
+  local want
+  [[ $1 == "$probe_partlabel" ]] && return 0
+  for want in "${probe_labels[@]}"; do
+    [[ ${2^^} == "$want" ]] && return 0
+  done
+  return 1
+}
+
+# Keep the evidence past the live session: copy the bundle into a new
+# directory under probe/ on the probe partition. Only a removable or USB
+# disk qualifies, so the probe never writes to the laptop's own disks.
+copy_to_probe_partition() {
+  local part partlabel label disk rm tran mnt dest copied=
+  while read -r part; do
+    # One device per query: with an empty PARTLABEL, the label would slide
+    # into its column on a shared lsblk -r line.
+    partlabel=$(lsblk -dno PARTLABEL "$part" 2>/dev/null)
+    label=$(lsblk -dno LABEL "$part" 2>/dev/null)
+    is_probe_partition "$partlabel" "$label" || continue
+    disk=$(lsblk -dnpo PKNAME "$part")
+    disk=${disk:-$part}
+    read -r rm tran < <(lsblk -dnro RM,TRAN "$disk")
+    if [[ $rm != 1 && $tran != usb ]]; then
+      echo "$part (${partlabel:-no name}, ${label:-no label}) is on $disk, which is neither removable nor on USB: not writing to it"
+      continue
+    fi
+    mnt=$(mktemp -d -t omarchy-probe.XXXXXX) || return 1
+    if ! mount -o rw,noatime "$part" "$mnt"; then
+      echo "Could not mount $part"
+      rmdir "$mnt"
+      continue
+    fi
+    dest=$mnt/probe/${bundle##*/}
+    mkdir -p "$dest" && cp -R "$bundle/." "$dest/" && copied=1
+    sync -f "$mnt"
+    umount "$mnt" && rmdir "$mnt"
+    if [[ -n $copied ]]; then
+      echo "Copied to $part on $disk: probe/${bundle##*/}"
+      return 0
+    fi
+    echo "Could not copy to $part"
+  done < <(lsblk -nrpo NAME)
+  echo "No removable or USB partition named $probe_partlabel or labelled ${probe_labels[*]}: the evidence stays in $bundle until the next boot"
+  return 1
 }
 
 {
@@ -16,6 +243,11 @@ section() {
   section kernel
   uname -a
   cat /proc/cmdline
+
+  section machine
+  for field in sys_vendor product_name product_family board_name bios_version; do
+    printf '%s=%s\n' "$field" "$(cat "/sys/class/dmi/id/$field" 2>/dev/null)"
+  done
 
   section consoles
   cat /sys/class/tty/console/active 2>/dev/null || true
@@ -45,6 +277,25 @@ section() {
   journalctl -b -k --no-pager | \
     grep -Ei 'efi|framebuffer|fbcon|simpledrm|drm|nvidia|nouveau|acpi|i2c|hid|r8127|mt79|mlx5' || true
 
+  # Some N1x firmware hides SSPM, HFRP and SVP0 when the kernel claims
+  # _OSI("Windows 2022"), and without SSPM the I2C controllers behind the
+  # keyboard and touchpad stay off, and so does the SPI sensor hub. Status 0
+  # is hidden, 15 present.
+  section "ACPI status of SSPM, HFRP, SVP0 and the I2C and SPI controllers"
+  for hid in NVDA8400 MTK00055 NVDA3000 NVDA0200 NVDA0210; do
+    found=
+    for dev in /sys/bus/acpi/devices/"$hid":*; do
+      [[ -e $dev ]] || continue
+      found=1
+      echo "${dev##*/} $(cat "$dev/path" 2>/dev/null) status=$(cat "$dev/status" 2>/dev/null || echo 'none (no _STA)')"
+    done
+    [[ -n $found ]] || echo "$hid: not in the ACPI namespace"
+  done
+
+  section evidence
+  collect_bundle
+  echo "$bundle"
+
   section network
   ip -4 -brief address | awk '$1 != "lo" && $3 { print $1, $3 }'
   # Only a --dev-ssh image lets anyone log in remotely.
@@ -54,3 +305,8 @@ section() {
     echo "  or, where mDNS works: ssh root@omarchy-n1x-rescue.local"
   fi
 } > >(tee "$log") 2>&1
+# The log goes with the bundle, so tee must have written all of it.
+wait $!
+
+cp "$log" "$bundle/" 2>/dev/null
+copy_to_probe_partition 2>&1 | tee -a "$log"

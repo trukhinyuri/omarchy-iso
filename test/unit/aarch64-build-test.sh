@@ -263,6 +263,13 @@ fi
 # --- recovery entry --------------------------------------------------------------
 grep -Fq "grep -qw 'omarchy.n1x_recovery=1' /proc/cmdline" "$ROOT/configs/airootfs/root/.automated_script.sh" \
   || fail "the N1x recovery entry would start the installer"
+# One key press while GRUB starts boots it. GRUB takes the first entry whose
+# hotkey matches, so no other entry may claim r.
+for cfg in grub.cfg loopback.cfg; do
+  grep -F -- "--id 'n1x-recovery'" "$ROOT/configs/grub/$cfg" | grep -Fq -- ' --hotkey r ' \
+    || fail "$cfg gives the N1x recovery entry no r hotkey"
+  [[ $(grep -c -- ' --hotkey r ' "$ROOT/configs/grub/$cfg") == 1 ]] || fail "$cfg gives the r hotkey to more than one entry"
+done
 
 # --- DEV ONLY: N1x debug SSH -------------------------------------------------------
 dev_ssh="$ROOT/builder/n1x-dev-ssh/omarchy-n1x-dev-ssh"
